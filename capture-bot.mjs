@@ -86,9 +86,17 @@ const AUTO_INGEST = env.AUTO_INGEST !== "0";
 // A staleness cap turns the deferral into what it was meant to be: a courtesy
 // to a live session, not an indefinite hold.
 const STALE_MS = (parseInt(env.INGEST_STALE_MINUTES || "90", 10)) * 60_000;
+// How long to wait before re-attempting an ingest that Claude's own usage limit
+// refused. Cheap by construction: a blocked attempt exits in seconds having done
+// no work, so polling costs nothing but a process spawn.
+const LIMIT_RETRY_MS = (parseInt(env.INGEST_LIMIT_RETRY_MINUTES || "30", 10)) * 60_000;
 let state = loadState();
 let lastMessageAt = 0;
 let ingestTimer = null;
+// True while ingest is parked on Claude's usage limit. Exists purely so Gregg is
+// told once, not once per retry — alarm fatigue is how a real warning gets
+// ignored, and the pre-fix bot sent four identical scary notices in one evening.
+let limitBlocked = false;
 
 async function tg(method, params = {}) {
   const res = await fetch(`${API}/${method}`, {
@@ -496,9 +504,22 @@ function trinovataDigest() {
   } catch (e) { log(`digest failed: ${e.message}`); }
 }
 
-function scheduleIngest() {
+function scheduleIngest(delayMs = QUIET_MS) {
   if (ingestTimer) clearTimeout(ingestTimer);
-  ingestTimer = setTimeout(() => {
+  ingestTimer = setTimeout(runIngest, delayMs);
+}
+
+// Distinguishes the one ingest failure that is NOT a fault in this pipeline:
+// Claude's own usage limit. Everything else — a crashed run, a permissions
+// refusal, a model that cleared nothing — still deserves a warning.
+function usageLimitReset(logPath) {
+  try {
+    const m = readFileSync(logPath, "utf8").match(/[^\n]*(?:hit your|usage|session) limit[^\n]*/i);
+    return m ? m[0].trim() : null;
+  } catch { return null; }
+}
+
+function runIngest() {
     const n = pendingCount();
     if (!n) return;
     const waited = oldestPendingMs();
@@ -544,13 +565,38 @@ function scheduleIngest() {
     child.on("close", (code) => {
       const after = pendingCount();
       const done = before - after;
-      log(`headless ingest exited ${code}: ${done} capture(s) cleared (${before} → ${after})`);
-      pushNotify(done > 0
-        ? `✅ Synthesis done — ${done} capture(s) processed, ${after} still waiting.\n\n→ /notes for what was written`
-        : `⚠️ Synthesis finished but cleared nothing (exit ${code}, ${after} still waiting). Worth a look.`);
+      const limit = usageLimitReset(logPath);
+      log(`headless ingest exited ${code}: ${done} capture(s) cleared (${before} → ${after})` +
+          (limit ? ` — blocked by usage limit (${limit})` : ""));
+
+      if (done > 0) {
+        limitBlocked = false;
+        pushNotify(`✅ Synthesis done — ${done} capture(s) processed, ${after} still waiting.\n\n→ /notes for what was written`);
+        // One headless run does not necessarily drain a 50-capture backlog. Keep
+        // going while progress is being made; done > 0 is what makes this
+        // terminate rather than spin.
+        if (after > 0) scheduleIngest();
+        return;
+      }
+
+      if (limit) {
+        // Retry on a fixed cheap interval rather than parsing the reset time out
+        // of "resets 4:50pm (America/New_York)". A localized clock time plus an
+        // IANA zone is a format that will drift, and a parser that quietly stops
+        // matching would strand captures exactly the way the unbounded deferral
+        // did. Polling is dumb, and dumb survives format changes.
+        if (!limitBlocked) {
+          limitBlocked = true;
+          pushNotify(`⏳ Synthesis is waiting on Claude's usage limit — ${after} capture(s) held.\n${limit}\nRetrying every ${LIMIT_RETRY_MS / 60_000}m; I'll report when it goes through.`);
+        }
+        log(`usage limit — retrying in ${LIMIT_RETRY_MS / 60_000}m`);
+        scheduleIngest(LIMIT_RETRY_MS);
+        return;
+      }
+
+      pushNotify(`⚠️ Synthesis finished but cleared nothing (exit ${code}, ${after} still waiting). Worth a look.`);
     });
     child.unref();
-  }, QUIET_MS);
 }
 
 // ---- Daily research scraper (directive D6) ----
