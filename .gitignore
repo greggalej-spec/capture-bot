@@ -1,0 +1,30 @@
+# Secrets and runtime state live in ~/.trinovata/, deliberately OUTSIDE this
+# folder — capture-bot.env holds the Telegram BOT_TOKEN and must never be in
+# Dev. These entries are belt-and-braces in case anything is ever created here
+# by mistake.
+*.env
+.env
+.env.*
+!*.env.example
+
+# Logs and state, if they ever land beside the code
+*.log
+*-state.json
+ingest-*.log
+
+# Node
+node_modules/
+package-lock.json
+npm-debug.log*
+
+# Captured payloads must never be committed. They are arbitrary forwarded
+# content from the internet — treated as untrusted data everywhere else in this
+# codebase, and they belong in the vault, not in source control.
+inbox/
+attachments/
+captures/
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store
