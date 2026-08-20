@@ -16,7 +16,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync, createWriteStream, openSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { spawn, execSync } from "node:child_process";
+import { spawn, execSync, execFileSync } from "node:child_process";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 // Remote quick actions (typed commands + tappable buttons) live in their own
@@ -90,6 +90,13 @@ const STALE_MS = (parseInt(env.INGEST_STALE_MINUTES || "90", 10)) * 60_000;
 // refused. Cheap by construction: a blocked attempt exits in seconds having done
 // no work, so polling costs nothing but a process spawn.
 const LIMIT_RETRY_MS = (parseInt(env.INGEST_LIMIT_RETRY_MINUTES || "30", 10)) * 60_000;
+// Hard ceiling on one headless ingest. WHY: the ingest is spawned detached, so a
+// hung run is immortal — nothing reaps it. On 19 Aug this machine held 29
+// claude.exe processes totalling ~8.6GB, the oldest started six days earlier, on
+// 31GB of RAM with 4GB free. That is why headless startup crawls. Retrying every
+// 30 minutes on top of an unreaped spawn would have turned a stalled pipeline
+// into a memory leak with a clock on it.
+const INGEST_TIMEOUT_MS = (parseInt(env.INGEST_TIMEOUT_MINUTES || "45", 10)) * 60_000;
 let state = loadState();
 let lastMessageAt = 0;
 let ingestTimer = null;
@@ -97,6 +104,10 @@ let ingestTimer = null;
 // told once, not once per retry — alarm fatigue is how a real warning gets
 // ignored, and the pre-fix bot sent four identical scary notices in one evening.
 let limitBlocked = false;
+// Guards against two headless ingests editing the same vault files at once —
+// the exact conflict the live-session deferral exists to prevent. The limit
+// retry makes a second spawn far more likely than arrival-debounce alone did.
+let ingestRunning = false;
 
 async function tg(method, params = {}) {
   const res = await fetch(`${API}/${method}`, {
@@ -522,6 +533,10 @@ function usageLimitReset(logPath) {
 function runIngest() {
     const n = pendingCount();
     if (!n) return;
+    if (ingestRunning) {
+      log(`${n} capture(s) pending; an ingest is already running — not spawning a second`);
+      return;
+    }
     const waited = oldestPendingMs();
     if (claudeRunning() && waited < STALE_MS) {
       const mins = Math.round(waited / 60_000);
@@ -559,10 +574,33 @@ function runIngest() {
     ], {
       cwd: VAULT_DIR, detached: true, stdio: ["ignore", logFd, logFd], windowsHide: true, shell: false,
     });
+    ingestRunning = true;
+    let timedOut = false;
+    // 'error' and 'close' can both fire for a single failed spawn. Whichever
+    // arrives first owns the outcome; the second must not re-notify or
+    // re-schedule a retry.
+    let settled = false;
+    // detached:true means child.kill() will not take the process tree down on
+    // Windows. taskkill /T /F is what actually reaps it. execFileSync with an
+    // argument array, not a shell string: no shell is involved anywhere else in
+    // this spawn path (shell:false above, by design) and there is no reason to
+    // reintroduce one to pass an integer. Wrapped because a child that already
+    // exited makes taskkill exit non-zero, which here is the desired outcome,
+    // not an error.
+    const killTimer = setTimeout(() => {
+      timedOut = true;
+      log(`ingest exceeded ${INGEST_TIMEOUT_MS / 60_000}m — killing pid ${child.pid}`);
+      try { execFileSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" }); }
+      catch { /* already gone */ }
+    }, INGEST_TIMEOUT_MS);
     // Report the OUTCOME, measured on disk, not the fact that a process started.
     // The previous version spawned and forgot, so a failed ingest looked exactly
     // like a successful one — from the outside and in the log.
     child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(killTimer);
+      ingestRunning = false;
       const after = pendingCount();
       const done = before - after;
       const limit = usageLimitReset(logPath);
@@ -576,6 +614,14 @@ function runIngest() {
         // going while progress is being made; done > 0 is what makes this
         // terminate rather than spin.
         if (after > 0) scheduleIngest();
+        return;
+      }
+
+      if (timedOut) {
+        // A timeout is not a usage limit and must not be retried on the quiet
+        // 30-minute loop: whatever wedged the run will wedge the next one, and
+        // each attempt leaves another 200MB+ process behind until it is reaped.
+        pushNotify(`⏱️ Synthesis was killed after ${INGEST_TIMEOUT_MS / 60_000}m without finishing — ${after} capture(s) still waiting. Something is wedging the run; it will not auto-retry until a new capture arrives.`);
         return;
       }
 
@@ -595,6 +641,18 @@ function runIngest() {
       }
 
       pushNotify(`⚠️ Synthesis finished but cleared nothing (exit ${code}, ${after} still waiting). Worth a look.`);
+    });
+    // Without this, a refused spawn (missing binary, denied execution) would
+    // leave ingestRunning true for the life of the bot, silently disabling
+    // ingest forever — a worse failure than the leak the flag exists to
+    // prevent. 'close' is not guaranteed to follow 'error'.
+    child.on("error", (e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(killTimer);
+      ingestRunning = false;
+      log(`headless ingest failed to spawn: ${e.message}`);
+      pushNotify(`⚠️ Synthesis could not start: ${e.message}\n${pendingCount()} capture(s) still waiting.`);
     });
     child.unref();
 }
