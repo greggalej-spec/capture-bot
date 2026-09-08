@@ -28,3 +28,7 @@ captures/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Worktree checkouts are duplicate copies of this repo, never content.
+# Committing them is how a repo ends up tracking itself as a gitlink.
+.claude/worktrees/
