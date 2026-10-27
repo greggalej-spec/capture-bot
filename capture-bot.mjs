@@ -22,6 +22,7 @@ import { pipeline } from "node:stream/promises";
 // Remote quick actions (typed commands + tappable buttons) live in their own
 // module so this file stays about capture, not about menus.
 import { routeCommand, routeCallback, buildMenu, errorMarkup, statusReport, chunk as chunkText } from "./commands.mjs";
+import { sweep as todoSweep } from "./todos.mjs";
 
 // A reply is a dead end if it reports a failure and offers nothing to do next.
 // Detecting that here — one place — means every command gets recovery buttons
@@ -580,11 +581,34 @@ function schedulerTick() {
   } catch (e) { log(`scheduler tick failed: ${e.message}`); }
 }
 
+// To-do reminders (todos.mjs). Sent with tg() rather than notify.mjs so they
+// can carry Done / +1h / Tomorrow buttons. Only ever to the locked owner chat.
+// A failed send is logged, not retried: the item is already marked reminded,
+// and it still shows (⚠️ overdue) in /todos and the morning list.
+let todoSweeping = false;
+async function todoReminders() {
+  if (todoSweeping || !state.ownerChatId) return;
+  todoSweeping = true;
+  try {
+    for (const m of todoSweep()) {
+      try {
+        await tg("sendMessage", { chat_id: state.ownerChatId, text: m.text, ...(m.markup ? { reply_markup: m.markup } : {}) });
+      } catch (e) { log(`todo reminder send failed: ${e.message}`); }
+    }
+  } catch (e) {
+    log(`todo sweep failed: ${e.message}`);
+  } finally {
+    todoSweeping = false;
+  }
+}
+
 async function main() {
   log(`capture-bot up. auto_ingest=${AUTO_INGEST} quiet=${QUIET_MS / 60000}m inbox=${NEW_DIR}`);
   schedulerTick();
   setInterval(schedulerTick, 3_600_000);        // hourly; the tick decides what is actually due
   setInterval(trinovataDigest, 30 * 60_000);    // digest gate decides whether to actually send
+  todoReminders();
+  setInterval(todoReminders, 5 * 60_000);       // reminders land within 5 minutes of their time
   // On boot: if captures accumulated while offline, schedule their ingest too.
   if (pendingCount()) { lastMessageAt = Date.now(); scheduleIngest(); }
   while (true) {

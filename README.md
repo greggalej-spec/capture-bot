@@ -113,3 +113,23 @@ Telegram's 4096-character limit.
 - Captures are never deleted: ingest moves them `new\` → `archived\`.
 - Security: no shell interpolation anywhere; capture text never enters a command
   line; the bot token stays outside Dev in `~\.trinovata\`.
+
+## To-dos and reminders
+
+Personal to-dos live in `%USERPROFILE%\.trinovata\todos.json` (outside Dev, never committed).
+
+| Command | What it does |
+|---|---|
+| `/todo call the bank @ tomorrow 9am` | Add a to-do with a reminder |
+| `/todo renew domain` | Add a to-do with no reminder |
+| `/todos` | Open list, overdue items marked |
+| `/done 3` | Tick off #3 |
+| `/snooze 3 in 2h` | Move #3's reminder |
+
+Times: `in 20m`, `in 2h`, `in 3d`, `5pm`, `21:30`, `today 5pm`, `tonight`, `tomorrow [time]`,
+`fri [time]`, `2026-11-02 14:00`. A bare day defaults to 9am. Machine local time.
+
+The bot checks every 5 minutes. A due to-do is sent once with ✅ Done / ⏰ +1h / 📅 Tomorrow
+buttons, and from 8am the open list is sent once a day. Reminders need the bot running,
+so they arrive when this PC is on. Tests: `node --test todos.test.mjs`.
+After changing commands, run `node register-commands.mjs` to update Telegram's "/" menu.

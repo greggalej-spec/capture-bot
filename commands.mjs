@@ -16,6 +16,7 @@ import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { homedir, totalmem, freemem } from "node:os";
+import { routeTodoCommand, routeTodoCallback } from "./todos.mjs";
 
 const DEV = "C:\\Users\\Gregg\\Dev";
 const VAULT = join(DEV, "Research", "vault");
@@ -455,6 +456,10 @@ export const COMMANDS = [
   { cmd: "local", desc: "Ask the local model — /local <prompt>", group: "read", arg: "<prompt>" },
   { cmd: "notes", desc: "Notes written in the last 24h", group: "read" },
   { cmd: "leads", desc: "Open client leads and decisions", group: "read" },
+  { cmd: "todo", desc: "Add a to-do — /todo <what> [@ when]", group: "read", arg: "<what> [@ when]" },
+  { cmd: "todos", desc: "Open to-dos", group: "read" },
+  { cmd: "done", desc: "Tick off a to-do — /done <n>", group: "read", arg: "<n>" },
+  { cmd: "snooze", desc: "Move a reminder — /snooze <n> <when>", group: "read", arg: "<n> <when>" },
   { cmd: "triage", desc: "Process waiting captures (confirms first)", group: "run" },
   { cmd: "scrape", desc: "Run the GitHub research sweep (confirms first)", group: "run" },
   ...PRICING.COMMANDS,
@@ -490,6 +495,8 @@ export function routeCommand(raw) {
   // switch below still sees every command it always did.
   const priced = PRICING.route(cmd, arg);
   if (priced) return priced;
+  const todo = routeTodoCommand(cmd, arg);
+  if (todo) return todo;
   switch (cmd) {
     case "start":
     case "menu": return { text: "Quick actions:", markup: buildMenu() };
@@ -531,6 +538,8 @@ export function routeCallback(data) {
   // it returns null for every other payload, so existing buttons are untouched.
   const priced = PRICING.routeCallback(data);
   if (priced) return priced;
+  const todo = routeTodoCallback(data);
+  if (todo) return todo;
   if (data.startsWith("confirm:")) {
     const a = data.slice(8);
     return a === "triage"
